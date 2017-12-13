@@ -5,6 +5,7 @@ import (
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/pkg/sysinfo"
+	"github.com/docker/docker/pkg/system"
 )
 
 // DefaultDaemonNetworkMode returns the default network stack the daemon should
@@ -77,7 +78,7 @@ func validatePrivileged(hc *container.HostConfig) error {
 	if hc == nil {
 		return nil
 	}
-	if hc.Privileged {
+	if hc.Privileged && !system.LCOWSupported() {
 		return fmt.Errorf("Windows does not support privileged mode")
 	}
 	return nil

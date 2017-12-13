@@ -1,12 +1,17 @@
 package daemon
 
 import (
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
-
+	"time"
+	
 	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/layer"
@@ -15,6 +20,7 @@ import (
 	"github.com/docker/docker/pkg/system"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/windows"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/windows/registry"
 )
 
@@ -217,37 +223,21 @@ func (daemon *Daemon) createSpec(c *container.Container) (*specs.Spec, error) {
 	} else {
 		// TODO @jhowardmsft LCOW Support. Modify this check when running in dual-mode
 		if system.LCOWSupported() && img.OS == "linux" {
-			daemon.createSpecLinuxFields(c, &s)
+			if err := daemon.createSpecLinuxFields(c, &s); err != nil {
+				return nil, err
+			}
+
+			daemon.createWindowsResourceFields(c, &s, isHyperV)
 		}
 	}
 
+	dumped, err := json.Marshal(s)
+	dumps := string(dumped)
+	logrus.Debugf("oci_windows: spec created %s",  dumps)
 	return (*specs.Spec)(&s), nil
 }
 
-// Sets the Windows-specific fields of the OCI spec
-func (daemon *Daemon) createSpecWindowsFields(c *container.Container, s *specs.Spec, isHyperV bool) error {
-	if len(s.Process.Cwd) == 0 {
-		// We default to C:\ to workaround the oddity of the case that the
-		// default directory for cmd running as LocalSystem (or
-		// ContainerAdministrator) is c:\windows\system32. Hence docker run
-		// <image> cmd will by default end in c:\windows\system32, rather
-		// than 'root' (/) on Linux. The oddity is that if you have a dockerfile
-		// which has no WORKDIR and has a COPY file ., . will be interpreted
-		// as c:\. Hence, setting it to default of c:\ makes for consistency.
-		s.Process.Cwd = `C:\`
-	}
-
-	s.Root.Readonly = false // Windows does not support a read-only root filesystem
-	if !isHyperV {
-		s.Root.Path = c.BaseFS.Path() // This is not set for Hyper-V containers
-		if !strings.HasSuffix(s.Root.Path, `\`) {
-			s.Root.Path = s.Root.Path + `\` // Ensure a correctly formatted volume GUID path \\?\Volume{GUID}\
-		}
-	}
-
-	// First boot optimization
-	s.Windows.IgnoreFlushesDuringBoot = !c.HasBeenStartedBefore
-
+func (daemon *Daemon) createWindowsResourceFields(c *container.Container, s *specs.Spec, isHyperV bool) error {
 	// In s.Windows.Resources
 	cpuShares := uint16(c.HostConfig.CPUShares)
 	cpuMaximum := uint16(c.HostConfig.CPUPercent) * 100
@@ -287,6 +277,113 @@ func (daemon *Daemon) createSpecWindowsFields(c *container.Container, s *specs.S
 			Iops: &c.HostConfig.IOMaximumIOps,
 		},
 	}
+
+	return nil
+}
+
+
+func getMemoryResources(config containertypes.Resources) *specs.LinuxMemory {
+	memory := specs.LinuxMemory{}
+
+	if config.Memory > 0 {
+		memory.Limit = &config.Memory
+	}
+
+	if config.MemoryReservation > 0 {
+		memory.Reservation = &config.MemoryReservation
+	}
+
+	if config.MemorySwap > 0 {
+		memory.Swap = &config.MemorySwap
+	}
+
+	if config.MemorySwappiness != nil {
+		swappiness := uint64(*config.MemorySwappiness)
+		memory.Swappiness = &swappiness
+	}
+
+	if config.KernelMemory != 0 {
+		memory.Kernel = &config.KernelMemory
+	}
+
+	return &memory
+}
+
+func getCPUResources(config containertypes.Resources) (*specs.LinuxCPU, error) {
+	cpu := specs.LinuxCPU{}
+
+	if config.CPUShares < 0 {
+		return nil, fmt.Errorf("shares: invalid argument")
+	}
+	if config.CPUShares >= 0 {
+		shares := uint64(config.CPUShares)
+		cpu.Shares = &shares
+	}
+
+	if config.CpusetCpus != "" {
+		cpu.Cpus = config.CpusetCpus
+	}
+
+	if config.CpusetMems != "" {
+		cpu.Mems = config.CpusetMems
+	}
+
+	if config.NanoCPUs > 0 {
+		// https://www.kernel.org/doc/Documentation/scheduler/sched-bwc.txt
+		period := uint64(100 * time.Millisecond / time.Microsecond)
+		quota := config.NanoCPUs * int64(period) / 1e9
+		cpu.Period = &period
+		cpu.Quota = &quota
+	}
+
+	if config.CPUPeriod != 0 {
+		period := uint64(config.CPUPeriod)
+		cpu.Period = &period
+	}
+
+	if config.CPUQuota != 0 {
+		q := config.CPUQuota
+		cpu.Quota = &q
+	}
+
+	if config.CPURealtimePeriod != 0 {
+		period := uint64(config.CPURealtimePeriod)
+		cpu.RealtimePeriod = &period
+	}
+
+	if config.CPURealtimeRuntime != 0 {
+		c := config.CPURealtimeRuntime
+		cpu.RealtimeRuntime = &c
+	}
+
+	return &cpu, nil
+}
+
+// Sets the Windows-specific fields of the OCI spec
+func (daemon *Daemon) createSpecWindowsFields(c *container.Container, s *specs.Spec, isHyperV bool) error {
+	if len(s.Process.Cwd) == 0 {
+		// We default to C:\ to workaround the oddity of the case that the
+		// default directory for cmd running as LocalSystem (or
+		// ContainerAdministrator) is c:\windows\system32. Hence docker run
+		// <image> cmd will by default end in c:\windows\system32, rather
+		// than 'root' (/) on Linux. The oddity is that if you have a dockerfile
+		// which has no WORKDIR and has a COPY file ., . will be interpreted
+		// as c:\. Hence, setting it to default of c:\ makes for consistency.
+		s.Process.Cwd = `C:\`
+	}
+
+	s.Root.Readonly = false // Windows does not support a read-only root filesystem
+	if !isHyperV {
+		s.Root.Path = c.BaseFS.Path() // This is not set for Hyper-V containers
+		if !strings.HasSuffix(s.Root.Path, `\`) {
+			s.Root.Path = s.Root.Path + `\` // Ensure a correctly formatted volume GUID path \\?\Volume{GUID}\
+		}
+	}
+
+	// First boot optimization
+	s.Windows.IgnoreFlushesDuringBoot = !c.HasBeenStartedBefore
+
+	daemon.createWindowsResourceFields(c, s, isHyperV)
 
 	// Read and add credentials from the security options if a credential spec has been provided.
 	if c.HostConfig.SecurityOpt != nil {
@@ -340,12 +437,253 @@ func (daemon *Daemon) createSpecWindowsFields(c *container.Container, s *specs.S
 // Sets the Linux-specific fields of the OCI spec
 // TODO: @jhowardmsft LCOW Support. We need to do a lot more pulling in what can
 // be pulled in from oci_linux.go.
-func (daemon *Daemon) createSpecLinuxFields(c *container.Container, s *specs.Spec) {
+func (daemon *Daemon) createSpecLinuxFields(c *container.Container, s *specs.Spec) error {
 	if len(s.Process.Cwd) == 0 {
 		s.Process.Cwd = `/`
 	}
 	s.Root.Path = "rootfs"
 	s.Root.Readonly = c.HostConfig.ReadonlyRootfs
+	
+	setDevices(s, c)
+
+	memoryRes := getMemoryResources(c.HostConfig.Resources)
+	cpuRes, err := getCPUResources(c.HostConfig.Resources)
+	if err != nil {
+		return err
+	}
+	specResources := &specs.LinuxResources{
+		Memory: memoryRes,
+		CPU:    cpuRes,
+	}
+
+	if s.Linux.Resources != nil && len(s.Linux.Resources.Devices) > 0 {
+		specResources.Devices = s.Linux.Resources.Devices
+	}
+
+	err = setCapabilities(s, c)
+	if err != nil {
+		return err
+	}
+
+	s.Linux.Resources = specResources
+
+	return nil
+}
+
+// inSlice tests whether a string is contained in a slice of strings or not.
+// Comparison is case insensitive
+func inSlice(slice []string, s string) bool {
+	for _, ss := range slice {
+		if strings.ToLower(s) == strings.ToLower(ss) {
+			return true
+		}
+	}
+	return false
+}
+
+func GetAllCapabilities() []string {
+	return []string {
+		"CAP_AUDIT_CONTROL",
+		"CAP_AUDIT_READ", 
+		"CAP_AUDIT_WRITE", 
+		"CAP_BLOCK_SUSPEND",
+		"CAP_CHOWN",
+		"CAP_DAC_OVERRIDE", 
+		"CAP_DAC_READ_SEARCH", 
+		"CAP_FOWNER", 
+		"CAP_FSETID", 
+		"CAP_IPC_LOCK", 
+		"CAP_IPC_OWNER", 
+		"CAP_KILL", 
+		"CAP_LEASE",  
+		"CAP_LINUX_IMMUTABLE", 
+		"CAP_MAC_ADMIN", 
+		"CAP_MAC_OVERRIDE",  
+		"CAP_MKNOD", 
+		"CAP_NET_ADMIN", 
+		"CAP_NET_BIND_SERVICE", 
+		"CAP_NET_BROADCAST", 
+		"CAP_NET_RAW", 
+		"CAP_SETGID", 
+		"CAP_SETFCAP", 
+		"CAP_SETPCAP", 
+		"CAP_SETUID", 
+		"CAP_SYS_ADMIN",
+		"CAP_SYS_BOOT",
+		"CAP_SYS_CHROOT",
+		"CAP_SYS_MODULE", 
+		"CAP_SYS_NICE",
+		"CAP_SYS_PACCT",
+		"CAP_SYS_PTRACE", 
+		"CAP_SYS_RAWIO",
+		"CAP_SYS_RESOURCE",
+		"CAP_SYS_TIME", 
+		"CAP_SYS_TTY_CONFIG",
+		"CAP_SYSLOG",
+		"CAP_WAKE_ALARM",
+	}
+}
+
+// TweakCapabilities can tweak capabilities by adding or dropping capabilities
+// based on the basics capabilities.
+func TweakCapabilities(basics, adds, drops []string) ([]string, error) {
+	var (
+		newCaps []string
+		allCaps = GetAllCapabilities()
+	)
+
+	// FIXME(tonistiigi): docker format is without CAP_ prefix, oci is with prefix
+	// Currently they are mixed in here. We should do conversion in one place.
+
+	// look for invalid cap in the drop list
+	for _, cap := range drops {
+		if strings.ToLower(cap) == "all" {
+			continue
+		}
+
+		if !inSlice(allCaps, "CAP_"+cap) {
+			return nil, fmt.Errorf("Unknown capability drop: %q", cap)
+		}
+	}
+
+	// handle --cap-add=all
+	if inSlice(adds, "all") {
+		basics = allCaps
+	}
+
+	if !inSlice(drops, "all") {
+		for _, cap := range basics {
+			// skip `all` already handled above
+			if strings.ToLower(cap) == "all" {
+				continue
+			}
+
+			// if we don't drop `all`, add back all the non-dropped caps
+			if !inSlice(drops, cap[4:]) {
+				newCaps = append(newCaps, strings.ToUpper(cap))
+			}
+		}
+	}
+
+	for _, cap := range adds {
+		// skip `all` already handled above
+		if strings.ToLower(cap) == "all" {
+			continue
+		}
+
+		cap = "CAP_" + cap
+
+		if !inSlice(allCaps, cap) {
+			return nil, fmt.Errorf("Unknown capability to add: %q", cap)
+		}
+
+		// add cap if not already in the list
+		if !inSlice(newCaps, cap) {
+			newCaps = append(newCaps, strings.ToUpper(cap))
+		}
+	}
+	return newCaps, nil
+}
+
+func setCapabilities(s *specs.Spec, c *container.Container) error {
+	var caplist []string
+	var err error
+	if c.HostConfig.Privileged {
+		caplist = GetAllCapabilities()
+	} else {
+		caplist, err = TweakCapabilities(s.Process.Capabilities.Effective, c.HostConfig.CapAdd, c.HostConfig.CapDrop)
+		if err != nil {
+			return err
+		}
+	}
+	s.Process.Capabilities.Effective = caplist
+	s.Process.Capabilities.Bounding = caplist
+	s.Process.Capabilities.Permitted = caplist
+	s.Process.Capabilities.Inheritable = caplist
+	return nil
+}
+
+// nolint: gosimple
+var (
+	deviceCgroupRuleRegex = regexp.MustCompile("^([acb]) ([0-9]+|\\*):([0-9]+|\\*) ([rwm]{1,3})$")
+)
+
+func setDevices(s *specs.Spec, c *container.Container) error {
+	// Build lists of devices allowed and created within the container.
+	var devs []specs.LinuxDevice
+	devPermissions := s.Linux.Resources.Devices
+    for _, deviceMapping := range c.HostConfig.Devices {
+		var major, minor int
+		var devType string
+		uid := uint32(0)
+		gid := uint32(0)
+		mode := os.FileMode(0666)
+
+		switch deviceMapping.PathOnHost {
+			// TODO: support more devices from http://www.lanana.org/docs/device-list/devices-2.6+.txt
+			case "/dev/fuse":
+				devType, major, minor ="c", 10, 229
+			default:
+				return fmt.Errorf("Unknown/unsupported: '%s'", deviceMapping.PathOnHost)
+		}
+		device := specs.LinuxDevice{
+			Type:        devType,
+			Path:        deviceMapping.PathOnHost,
+			Major:       int64(major),
+			Minor:       int64(minor),
+			FileMode:    &mode,
+			UID:         &uid,
+			GID:         &gid,
+		}
+		devs = append(devs, device)
+		devPermissions = append(devPermissions, 
+			specs.LinuxDeviceCgroup{
+				Allow:  true,
+				Type:   devType,
+				Major:  &device.Major,
+				Minor:  &device.Minor,
+				Access: "rwm",
+		})
+	}
+
+    for _, deviceCgroupRule := range c.HostConfig.DeviceCgroupRules {
+        ss := deviceCgroupRuleRegex.FindAllStringSubmatch(deviceCgroupRule, -1)
+        if len(ss[0]) != 5 {
+            return fmt.Errorf("invalid device cgroup rule format: '%s'", deviceCgroupRule)
+        }
+        matches := ss[0]
+
+        dPermissions := specs.LinuxDeviceCgroup{
+            Allow:  true,
+            Type:   matches[1],
+            Access: matches[4],
+        }
+        if matches[2] == "*" {
+            major := int64(-1)
+            dPermissions.Major = &major
+        } else {
+            major, err := strconv.ParseInt(matches[2], 10, 64)
+            if err != nil {
+                return fmt.Errorf("invalid major value in device cgroup rule format: '%s'", deviceCgroupRule)
+            }
+            dPermissions.Major = &major
+        }
+        if matches[3] == "*" {
+            minor := int64(-1)
+            dPermissions.Minor = &minor
+        } else {
+            minor, err := strconv.ParseInt(matches[3], 10, 64)
+            if err != nil {
+                return fmt.Errorf("invalid minor value in device cgroup rule format: '%s'", deviceCgroupRule)
+            }
+            dPermissions.Minor = &minor
+        }
+        devPermissions = append(devPermissions, dPermissions)
+    }
+
+	s.Linux.Devices = append(s.Linux.Devices, devs...)
+	s.Linux.Resources.Devices = devPermissions
+	return nil
 }
 
 func escapeArgs(args []string) []string {

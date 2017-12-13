@@ -158,41 +158,7 @@ func (c *client) createWindows(id string, spec *specs.Spec, runtimeOptions inter
 		Servicing:               spec.Windows.Servicing,
 	}
 
-	if spec.Windows.Resources != nil {
-		if spec.Windows.Resources.CPU != nil {
-			if spec.Windows.Resources.CPU.Count != nil {
-				// This check is being done here rather than in adaptContainerSettings
-				// because we don't want to update the HostConfig in case this container
-				// is moved to a host with more CPUs than this one.
-				cpuCount := *spec.Windows.Resources.CPU.Count
-				hostCPUCount := uint64(sysinfo.NumCPU())
-				if cpuCount > hostCPUCount {
-					c.logger.Warnf("Changing requested CPUCount of %d to current number of processors, %d", cpuCount, hostCPUCount)
-					cpuCount = hostCPUCount
-				}
-				configuration.ProcessorCount = uint32(cpuCount)
-			}
-			if spec.Windows.Resources.CPU.Shares != nil {
-				configuration.ProcessorWeight = uint64(*spec.Windows.Resources.CPU.Shares)
-			}
-			if spec.Windows.Resources.CPU.Maximum != nil {
-				configuration.ProcessorMaximum = int64(*spec.Windows.Resources.CPU.Maximum)
-			}
-		}
-		if spec.Windows.Resources.Memory != nil {
-			if spec.Windows.Resources.Memory.Limit != nil {
-				configuration.MemoryMaximumInMB = int64(*spec.Windows.Resources.Memory.Limit) / 1024 / 1024
-			}
-		}
-		if spec.Windows.Resources.Storage != nil {
-			if spec.Windows.Resources.Storage.Bps != nil {
-				configuration.StorageBandwidthMaximum = *spec.Windows.Resources.Storage.Bps
-			}
-			if spec.Windows.Resources.Storage.Iops != nil {
-				configuration.StorageIOPSMaximum = *spec.Windows.Resources.Storage.Iops
-			}
-		}
-	}
+	c.setResourceLimits(configuration, spec)
 
 	if spec.Windows.HyperV != nil {
 		configuration.HvPartition = true
@@ -349,6 +315,44 @@ func (c *client) createWindows(id string, spec *specs.Spec, runtimeOptions inter
 
 }
 
+func (c *client) setResourceLimits(configuration *hcsshim.ContainerConfig, spec *specs.Spec){	
+	if spec.Windows.Resources != nil {
+		if spec.Windows.Resources.CPU != nil {
+			if spec.Windows.Resources.CPU.Count != nil {
+				// This check is being done here rather than in adaptContainerSettings
+				// because we don't want to update the HostConfig in case this container
+				// is moved to a host with more CPUs than this one.
+				cpuCount := *spec.Windows.Resources.CPU.Count
+				hostCPUCount := uint64(sysinfo.NumCPU())
+				if cpuCount > hostCPUCount {
+					c.logger.Warnf("Changing requested CPUCount of %d to current number of processors, %d", cpuCount, hostCPUCount)
+					cpuCount = hostCPUCount
+				}
+				configuration.ProcessorCount = uint32(cpuCount)
+			}
+			if spec.Windows.Resources.CPU.Shares != nil {
+				configuration.ProcessorWeight = uint64(*spec.Windows.Resources.CPU.Shares)
+			}
+			if spec.Windows.Resources.CPU.Maximum != nil {
+				configuration.ProcessorMaximum = int64(*spec.Windows.Resources.CPU.Maximum)
+			}
+		}
+		if spec.Windows.Resources.Memory != nil {
+			if spec.Windows.Resources.Memory.Limit != nil {
+				configuration.MemoryMaximumInMB = int64(*spec.Windows.Resources.Memory.Limit) / 1024 / 1024
+			}
+		}
+		if spec.Windows.Resources.Storage != nil {
+			if spec.Windows.Resources.Storage.Bps != nil {
+				configuration.StorageBandwidthMaximum = *spec.Windows.Resources.Storage.Bps
+			}
+			if spec.Windows.Resources.Storage.Iops != nil {
+				configuration.StorageIOPSMaximum = *spec.Windows.Resources.Storage.Iops
+			}
+		}
+	}
+}
+
 func (c *client) createLinux(id string, spec *specs.Spec, runtimeOptions interface{}) error {
 	logrus.Debugf("libcontainerd: createLinux(): containerId %s ", id)
 	logger := c.logger.WithField("container", id)
@@ -369,6 +373,8 @@ func (c *client) createLinux(id string, spec *specs.Spec, runtimeOptions interfa
 		Owner:         defaultOwner,
 		TerminateOnLastHandleClosed: true,
 	}
+	
+	c.setResourceLimits(configuration, spec)
 
 	if lcowConfig.ActualMode == opengcs.ModeActualVhdx {
 		configuration.HvRuntime = &hcsshim.HvRuntime{
@@ -617,6 +623,8 @@ func (c *client) Start(_ context.Context, id, _ string, withStdin bool, attachSt
 	// GCS for the utility VM.
 	if !ctr.isWindows {
 		ociBuf, err := json.Marshal(ctr.ociSpec)
+		ociStr := string(ociBuf)
+		logrus.Debugf("libcontainerd: Start(): ociSpec %s ", ociStr)
 		if err != nil {
 			return -1, err
 		}

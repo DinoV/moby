@@ -1132,24 +1132,27 @@ func (c *client) DeleteTask(ctx context.Context, containerID string) (uint32, ti
 }
 
 func (c *client) Delete(_ context.Context, containerID string) error {
-	c.Lock()
+	c.Lock()        
 	ctr := c.containers[containerID]
 	if ctr == nil {
-                c.Unlock()
 		return errors.WithStack(newNotFoundError("no such container"))
 	}
-        c.Unlock()
+	c.Unlock()
 
-	switch ctr.status {
+        ctr.Lock()
+        status := ctr.status
+        ctr.Unlock()
+
+	switch status {
 	case StatusCreated:
 		if err := c.shutdownContainer(ctr); err != nil {
 			return err
 		}
 		fallthrough
 	case StatusStopped:
-    	        ctr.Lock()
+ 	        c.Lock()
 		delete(c.containers, containerID)
-                ctr.Unlock()
+                c.Unlock()
 		return nil
 	}
 
